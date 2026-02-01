@@ -1,0 +1,18 @@
+{
+  "6143574543": {
+    "user_id": 6143574543,
+    "default_agent": 1,
+    "agents": {
+      "1": {
+        "agent_id": 1,
+        "session_id": "59fd0c71-aac4-4f98-9241-4aed3fc45121",
+        "user_id": 6143574543,
+        "name": "Main Agent",
+        "created_at": "2026-01-30T21:17:01.414040",
+        "last_used": "2026-01-30T21:24:18.754363",
+        "message_count": 4,
+        "is_active": true
+      }
+    }
+  }
+}
