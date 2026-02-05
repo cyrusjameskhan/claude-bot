@@ -30,3 +30,7 @@ ollama>=0.4.0
 
 # Aider for local LLM coding (Ollama support)
 aider-chat>=0.50.0
+
+# Scheduler for reminders (persistent CRON jobs)
+APScheduler>=3.10.0
+SQLAlchemy>=2.0.0

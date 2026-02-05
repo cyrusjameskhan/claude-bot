@@ -26,6 +26,7 @@ from security import create_security_manager, CommandValidator, SecurityManager
 from transcriber import create_voice_handler, VoiceHandler
 from claude_runner import create_task_queue, TaskQueue
 from agent_manager import AgentManager, parse_agent_command
+from scheduler import ReminderScheduler, set_scheduler, get_scheduler
 
 # Configure logging
 logging.basicConfig(
@@ -41,6 +42,7 @@ voice_handler: Optional[VoiceHandler] = None
 task_queue: Optional[TaskQueue] = None
 agent_manager: Optional[AgentManager] = None
 telegram_app: Optional[Application] = None
+reminder_scheduler: Optional[ReminderScheduler] = None
 
 
 # ============================================================================
@@ -136,6 +138,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 /model - View current model & options
 /model sonnet - Switch to Sonnet
 /model opus - Switch to Opus
+
+**Reminders:**
+/reminders - List your scheduled reminders
+/reminders cancel <id> - Cancel a reminder
+Ask naturally: "Remind me to X in 30 minutes"
 
 **Usage:**
 - Plain messages go to Agent 1 (default)
@@ -381,6 +388,64 @@ async def cmd_wipe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /reminders command - list and manage scheduled reminders."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    
+    if not await check_authorization(update, user_id):
+        return
+    
+    scheduler = get_scheduler()
+    if not scheduler:
+        await update.message.reply_text("Reminder system is not available.")
+        return
+    
+    # Check for cancel subcommand: /reminders cancel <job_id>
+    if context.args and len(context.args) >= 2 and context.args[0].lower() == "cancel":
+        job_id = context.args[1]
+        if scheduler.cancel_reminder(job_id):
+            await update.message.reply_text(
+                f"✅ Cancelled reminder `{job_id}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ Reminder `{job_id}` not found",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        return
+    
+    # List reminders for this chat
+    reminders = scheduler.get_reminders(chat_id)
+    
+    if not reminders:
+        await update.message.reply_text(
+            "**No scheduled reminders**\n\n"
+            "Ask me to set a reminder, for example:\n"
+            "• \"Remind me to check the oven in 30 minutes\"\n"
+            "• \"Remind me to call mom at 3pm tomorrow\"\n"
+            "• \"Remind me every Monday at 9am about the standup\"",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    lines = ["**Your Scheduled Reminders:**\n"]
+    for r in reminders:
+        trigger_type = r['trigger_type'].replace('Trigger', '')
+        next_run = r['next_run'][:19] if r['next_run'] else 'N/A'
+        lines.append(
+            f"**{r['name']}**\n"
+            f"  ID: `{r['id']}`\n"
+            f"  Type: {trigger_type}\n"
+            f"  Next: {next_run}\n"
+        )
+    
+    lines.append("\n**To cancel:** `/reminders cancel <id>`")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
 async def cmd_agent_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /N commands where N is an agent number."""
     user_id = update.effective_user.id
@@ -512,7 +577,8 @@ async def process_task(
             user_id=user_id,
             task_type=task_type,
             agent_id=agent_id,
-            is_new_session=is_new
+            is_new_session=is_new,
+            chat_id=update.effective_chat.id  # Pass chat_id for reminder scheduling
         )
         
         # Update agent usage
@@ -639,6 +705,7 @@ def setup_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("terminate", cmd_terminate))
     app.add_handler(CommandHandler("wipe", cmd_wipe))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("reminders", cmd_reminders))
     
     # Task type commands
     for task_type in ALLOWED_TASK_TYPES:
@@ -670,6 +737,7 @@ async def set_bot_commands(app: Application) -> None:
         BotCommand("new", "Create new agent"),
         BotCommand("model", "View/change LLM model"),
         BotCommand("terminate", "Close an agent"),
+        BotCommand("reminders", "List/cancel reminders"),
         BotCommand("wipe", "Clear all agents & chat"),
         BotCommand("status", "Check session status"),
         BotCommand("cancel", "Cancel running task"),
@@ -680,7 +748,7 @@ async def set_bot_commands(app: Application) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan handler for startup/shutdown."""
-    global settings, security_manager, voice_handler, task_queue, agent_manager, telegram_app
+    global settings, security_manager, voice_handler, task_queue, agent_manager, telegram_app, reminder_scheduler
     
     logger.info("Starting up...")
     
@@ -707,6 +775,29 @@ async def lifespan(app: FastAPI):
     await telegram_app.initialize()
     await set_bot_commands(telegram_app)
     
+    # Initialize reminder scheduler with Telegram send callback
+    async def send_reminder_message(chat_id: int, message: str) -> None:
+        """Callback to send reminder messages via Telegram."""
+        try:
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            logger.error(f"Failed to send reminder to {chat_id}: {e}")
+    
+    reminder_scheduler = ReminderScheduler(
+        send_callback=send_reminder_message,
+        db_path=str(settings.working_directory / "data" / "reminders.db")
+    )
+    reminder_scheduler.start()
+    set_scheduler(reminder_scheduler)
+    logger.info("Reminder scheduler initialized")
+    
+    # Make scheduler available to task_queue runner for AI tool access
+    task_queue.runner.reminder_scheduler = reminder_scheduler
+    
     if settings.use_webhook:
         # Webhook mode
         webhook_url = f"{settings.webhook_url}/webhook"
@@ -724,6 +815,11 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down...")
+    
+    # Stop scheduler first
+    if reminder_scheduler:
+        reminder_scheduler.shutdown()
+        logger.info("Reminder scheduler stopped")
     
     if settings.use_webhook:
         await telegram_app.bot.delete_webhook()
