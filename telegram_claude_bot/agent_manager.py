@@ -115,18 +115,27 @@ class AgentManager:
                 self._user_agents = {}
     
     def _save_sessions(self) -> None:
-        """Save sessions to disk."""
+        """Save sessions to disk atomically."""
         data = {}
         for user_id, user_agents in self._user_agents.items():
             data[str(user_id)] = {
                 "user_id": user_id,
                 "default_agent": user_agents.default_agent,
                 "agents": {
-                    str(aid): asdict(agent) 
+                    str(aid): asdict(agent)
                     for aid, agent in user_agents.agents.items()
                 }
             }
-        self._sessions_file.write_text(json.dumps(data, indent=2))
+        tmp = self._sessions_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.rename(self._sessions_file)
+
+    def clear_user_sessions(self, user_id: int) -> None:
+        """Clear all sessions for a user."""
+        if user_id in self._user_agents:
+            del self._user_agents[user_id]
+            self._save_sessions()
+            logger.info(f"Cleared all sessions for user {user_id}")
     
     def get_user_agents(self, user_id: int) -> UserAgents:
         """Get or create user agents container."""

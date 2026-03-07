@@ -40,39 +40,22 @@ class TaskResult:
     task_type: Optional[str]
     created_at: str
     
-    def to_telegram_message(self, max_length: int = 4000) -> str:
-        """Format result for Telegram message."""
-        status_emoji = {
-            TaskStatus.COMPLETED: "✅",
-            TaskStatus.FAILED: "❌",
-            TaskStatus.TIMEOUT: "⏰",
-            TaskStatus.REJECTED: "🚫",
-            TaskStatus.RUNNING: "⏳",
-            TaskStatus.PENDING: "📋",
-        }
-        
-        emoji = status_emoji.get(self.status, "❓")
-        
-        lines = [
-            f"{emoji} **Task {self.status.value.upper()}**",
-            f"⏱️ Time: {self.execution_time:.1f}s",
-        ]
-        
-        if self.task_type:
-            lines.append(f"📂 Type: {self.task_type}")
-        
+    def to_telegram_message(self, max_length: int = 4000, agent_id: int = 1) -> str:
+        """Format result for Telegram message as plain output."""
+        lines = []
+
         if self.output:
             output = self.output
-            # Reserve space for metadata
-            available = max_length - len("\n".join(lines)) - 50
-            if len(output) > available:
-                output = output[:available] + "\n... (truncated)"
-            lines.append(f"\n📤 **Output:**\n```\n{output}\n```")
-        
+            if len(output) > max_length:
+                output = output[:max_length] + "\n... (truncated)"
+            lines.append(output)
+
         if self.error:
             error = self.error[:500] if len(self.error) > 500 else self.error
-            lines.append(f"\n⚠️ **Error:**\n```\n{error}\n```")
-        
+            if lines:
+                lines.append("")
+            lines.append(f"Error:\n{error}")
+
         return "\n".join(lines)
 
 
@@ -85,9 +68,9 @@ class ClaudeCodeRunner:
     # Available models - Claude and Ollama
     AVAILABLE_MODELS = {
         # Claude models
-        "opus": "claude-opus-4-20250514",
-        "sonnet": "claude-sonnet-4-20250514", 
-        "haiku": "claude-haiku-4-20250514",
+        "opus": "claude-opus-4-5",
+        "sonnet": "claude-sonnet-4-5",
+        "haiku": "claude-haiku-4-5-20251001",
         # Ollama models (prefix with ollama:)
         # GLM-4.7-flash is RECOMMENDED - properly supports tool calling format
         "glm": "ollama:glm-4.7-flash",
@@ -111,26 +94,28 @@ class ClaudeCodeRunner:
     OLLAMA_URL = "http://localhost:11434/api/chat"
     
     def __init__(
-        self, 
+        self,
         working_dir: Path,
         claude_path: Optional[str] = None,
         timeout: int = 300,
-        default_model: str = "claude-sonnet-4-20250514"
+        default_model: str = "claude-sonnet-4-20250514",
+        brave_search_client = None
     ):
         self.working_dir = working_dir
         self.timeout = timeout
         self.default_model = default_model
-        
+
         # Find Claude Code CLI
         self.claude_path = claude_path or self._find_claude_cli()
         if not self.claude_path:
             logger.warning("Claude Code CLI not found in PATH. Will try 'claude' command.")
             self.claude_path = "claude"
-        
+
         self._running_tasks: dict[str, asyncio.subprocess.Process] = {}
         self._user_models: dict[int, str] = {}  # Per-user model preferences
         self._ollama_histories: dict[str, list] = {}  # Conversation history for Ollama
         self.reminder_scheduler = None  # Set by bot.py on startup
+        self.brave_search = brave_search_client  # Brave Search client
     
     def is_ollama_model(self, model: str) -> bool:
         """Check if the model is an Ollama model."""
@@ -267,7 +252,34 @@ class ClaudeCodeRunner:
         return f"{user_id}_{agent_id}"
     
     # System prompt for Ollama models - agentic capabilities with tools
-    OLLAMA_SYSTEM_PROMPT = """You are an AI coding agent running on a Windows PC. You can execute commands, read files, write files, and schedule reminders.
+    OLLAMA_SYSTEM_PROMPT = """You are an AI coding agent running on a Windows PC. You can execute commands, read files, write files, schedule reminders, and search the web.
+
+## TELEGRAM MARKDOWN FORMATTING
+
+Your responses are sent via Telegram with ParseMode.MARKDOWN. Follow these rules:
+
+**Supported:**
+- `*bold text*` for bold
+- `_italic text_` for italic
+- `` `inline code` `` for inline code
+- ` ```code block``` ` for code blocks
+- `[link text](URL)` for inline links
+
+**NOT Supported (avoid these):**
+- Underline, strikethrough, spoilers (use MarkdownV2 only)
+- Nested formatting (bold inside italic)
+- Headers (#, ##, ###)
+
+**Escaping:**
+- Escape `_`, `*`, `` ` ``, `[` with backslash `\` when NOT using them for formatting
+- Example: `\_not italic\_` renders as _not italic_
+
+**Best Practices:**
+- Keep formatting simple and clean
+- Use code blocks for command output
+- Use inline code for file paths and commands
+- Use bold sparingly for emphasis
+- Test links are properly formatted: `[text](URL)` with no spaces
 
 ## YOUR TOOLS
 
@@ -284,7 +296,10 @@ YOUR_COMMAND_HERE
 file content here
 </write_file>
 
-### 4. Schedule a reminder:
+### 4. Search the web:
+<web_search>your search query here</web_search>
+
+### 5. Schedule a reminder:
 <schedule_reminder>{"message": "Your reminder text", "type": "delay", "minutes": 30}</schedule_reminder>
 
 Reminder types:
@@ -294,7 +309,7 @@ Reminder types:
 
 Cron format: "minute hour day month day_of_week" (e.g., "0 9 * * MON" = every Monday 9am)
 
-### 5. Signal task completion:
+### 6. Signal task completion:
 <done>Brief summary of what was accomplished</done>
 
 ## HOW TO WORK
@@ -489,6 +504,34 @@ You're working in the user's home folder. Use relative paths when possible."""
         except Exception as e:
             return f"Error writing file: {str(e)}"
     
+    async def _web_search(self, query: str) -> str:
+        """
+        Perform a web search using Brave Search API.
+        Returns formatted search results.
+        """
+        if not self.brave_search:
+            return "⚠️ Web search not available (Brave Search API not configured)"
+
+        try:
+            results = await self.brave_search.web_search(query, count=3)
+            web_results = results.get("web", {}).get("results", [])
+
+            if not web_results:
+                return "No results found."
+
+            # Format results concisely for AI consumption
+            formatted = []
+            for i, result in enumerate(web_results[:3], 1):
+                title = result.get("title", "No title")
+                url = result.get("url", "")
+                description = result.get("description", "")
+                formatted.append(f"{i}. **{title}**\n   URL: {url}\n   {description}\n")
+
+            return "\n".join(formatted)
+        except Exception as e:
+            logger.error(f"Web search error: {e}")
+            return f"⚠️ Search failed: {str(e)}"
+
     async def _schedule_reminder(self, chat_id: int, params: dict) -> str:
         """
         Schedule a reminder using the ReminderScheduler.
@@ -608,7 +651,17 @@ You're working in the user's home folder. Use relative paths when possible."""
             # Replace in result
             replacement = f"📝 **Writing {filepath}:** {write_result}"
             result = result.replace(match.group(0), replacement, 1)
-        
+
+        # Process <web_search> tags
+        search_pattern = r'<web_search>\s*(.*?)\s*</web_search>'
+        for match in re.finditer(search_pattern, text, re.DOTALL | re.IGNORECASE):
+            query = match.group(1).strip()
+            search_result = await self._web_search(query)
+            tool_results.append(f"[WEB_SEARCH] {query}\n[RESULTS]\n{search_result}")
+            # Replace in result
+            replacement = f"🔍 **Searching:** {query}\n\n{search_result}"
+            result = result.replace(match.group(0), replacement, 1)
+
         # Process <schedule_reminder> tags
         reminder_pattern = r'<schedule_reminder>\s*(.*?)\s*</schedule_reminder>'
         for match in re.finditer(reminder_pattern, text, re.DOTALL | re.IGNORECASE):
@@ -683,6 +736,12 @@ You're working in the user's home folder. Use relative paths when possible."""
                 tool_results.append(f"[EXECUTE] {command}\n[RESULT] {result}")
                 output_parts.append(f"```powershell\n{command}\n```\n**Output:**\n```\n{result}\n```")
                 
+            elif func_name in ["web_search", "search", "brave_search"]:
+                query = args.get("query", "") or args.get("q", "")
+                result = await self._web_search(query)
+                tool_results.append(f"[WEB_SEARCH] {query}\n[RESULTS]\n{result}")
+                output_parts.append(f"🔍 **Searching:** {query}\n\n{result}")
+
             elif func_name == "schedule_reminder":
                 if chat_id:
                     result = await self._schedule_reminder(chat_id, args)
@@ -690,7 +749,7 @@ You're working in the user's home folder. Use relative paths when possible."""
                     result = "⚠️ Cannot schedule reminder: chat_id not available"
                 tool_results.append(f"[SCHEDULE_REMINDER]\n[RESULT] {result}")
                 output_parts.append(f"⏰ **Scheduling reminder:** {result}")
-                
+
             elif func_name == "done" or func_name == "task_complete":
                 is_done = True
                 summary = args.get("summary", "") or args.get("message", "Task completed")
@@ -969,6 +1028,7 @@ You're working in the user's home folder. Use relative paths when possible."""
         
         # Use default environment for Claude models
         env = os.environ.copy()
+        env.pop("CLAUDECODE", None)  # Allow nested Claude Code invocation
         
         try:
             # Create subprocess in agent-specific directory
@@ -1132,12 +1192,13 @@ class TaskQueue:
         return list(reversed(history))
 
 
-def create_task_queue(settings) -> TaskQueue:
+def create_task_queue(settings, brave_search_client=None) -> TaskQueue:
     """Factory function to create TaskQueue from settings."""
     runner = ClaudeCodeRunner(
         working_dir=settings.working_directory,
         claude_path=settings.claude_code_path,
         timeout=settings.task_timeout,
-        default_model=settings.claude_model
+        default_model=settings.claude_model,
+        brave_search_client=brave_search_client
     )
     return TaskQueue(runner)

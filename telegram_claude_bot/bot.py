@@ -8,6 +8,8 @@ import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request, HTTPException
@@ -20,6 +22,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ParseMode, ChatAction
+from telegram.error import BadRequest
 
 from config import load_settings, ALLOWED_TASK_TYPES
 from security import create_security_manager, CommandValidator, SecurityManager
@@ -27,6 +30,9 @@ from transcriber import create_voice_handler, VoiceHandler
 from claude_runner import create_task_queue, TaskQueue
 from agent_manager import AgentManager, parse_agent_command
 from scheduler import ReminderScheduler, set_scheduler, get_scheduler
+from brave_search import create_brave_search_client, BraveSearchClient
+from memory_cache import MemoryCache, SessionCache, DailyScratchpad
+from markdown_utils import sanitize_markdown_for_telegram, strip_all_markdown
 
 # Configure logging
 logging.basicConfig(
@@ -43,6 +49,38 @@ task_queue: Optional[TaskQueue] = None
 agent_manager: Optional[AgentManager] = None
 telegram_app: Optional[Application] = None
 reminder_scheduler: Optional[ReminderScheduler] = None
+brave_search: Optional[BraveSearchClient] = None
+
+# Caching system (PERSONA_CACHE pattern)
+memory_cache: Optional[MemoryCache] = None
+session_cache: Optional[SessionCache] = None
+daily_scratchpad: Optional[DailyScratchpad] = None
+
+# Lock for atomic disk writes
+_disk_lock = asyncio.Lock()
+
+MEMORY_FILE = Path("data") / "MEMORY.md"
+
+
+async def _atomic_write(path: Path, content: str) -> None:
+    """Write content to path atomically via a temp file + rename."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    await asyncio.to_thread(tmp.write_text, content, encoding="utf-8")
+    await asyncio.to_thread(tmp.rename, path)
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+async def _keep_typing(chat, bot):
+    """Continuously send typing indicator every 4 seconds."""
+    try:
+        while True:
+            await chat.send_action(ChatAction.TYPING)
+            await asyncio.sleep(4)  # Send every 4 seconds (expires after 5)
+    except asyncio.CancelledError:
+        pass  # Task was cancelled, stop typing
 
 
 # ============================================================================
@@ -125,6 +163,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 /help - This help message
 /status - Check your session
 /cancel - Cancel running task
+/search <query> - Search the web with Brave
 
 **Multi-Agent Commands:**
 /agents - List all your active agents
@@ -139,6 +178,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 /model sonnet - Switch to Sonnet
 /model opus - Switch to Opus
 
+**Session & Memory:**
+/session clear - Wipe your session data
+/memory promote <text> - Append a note to MEMORY.md
+
 **Reminders:**
 /reminders - List your scheduled reminders
 /reminders cancel <id> - Cancel a reminder
@@ -152,8 +195,9 @@ Ask naturally: "Remind me to X in 30 minutes"
 **Task Types:**
 /code, /explain, /review, /debug, /test, /docs, /refactor
 
-**Voice Notes:**
-Send a voice message - it will be transcribed and processed.
+**Media Support:**
+📷 Photos - Send an image for AI analysis (with optional caption)
+🎤 Voice - Send a voice message - it will be transcribed and processed
 """
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -388,6 +432,48 @@ async def cmd_wipe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /search command - search the web using Brave Search."""
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, user_id):
+        return
+
+    if not brave_search:
+        await update.message.reply_text("Search is not available (API key not configured).")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Please provide a search query:\n"
+            "`/search your query here`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    query = " ".join(context.args)
+
+    # Show typing indicator
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    try:
+        # Perform search
+        results = await brave_search.web_search(query, count=5)
+
+        # Format results
+        formatted = brave_search.format_results_for_telegram(results, max_results=5)
+
+        await update.message.reply_text(
+            formatted,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True
+        )
+
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        await update.message.reply_text(f"Search failed: {str(e)[:200]}")
+
+
 async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /reminders command - list and manage scheduled reminders."""
     user_id = update.effective_user.id
@@ -446,6 +532,94 @@ async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /session command — manage session data."""
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, user_id):
+        return
+
+    if not context.args or context.args[0].lower() != "clear":
+        await update.message.reply_text(
+            "**Session Commands:**\n"
+            "`/session clear` — Delete your session data and start fresh",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    async with _disk_lock:
+        agent_manager.clear_user_sessions(user_id)
+
+    await update.message.reply_text(
+        "Session cleared. All agent history wiped.\n"
+        "Send a message to start fresh.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /memory command — manage persistent MEMORY.md."""
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, user_id):
+        return
+
+    if not context.args or context.args[0].lower() != "promote":
+        await update.message.reply_text(
+            "**Memory Commands:**\n"
+            "`/memory promote <text>` — Append a note to MEMORY.md",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Please provide text to promote:\n"
+            "`/memory promote your note here`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    text = " ".join(context.args[1:]).strip()
+
+    # Use cached memory system
+    async with _disk_lock:
+        await memory_cache.append_to_memory(text)
+
+    # Also log to daily scratchpad
+    await daily_scratchpad.append(f"Memory promoted: {text}")
+
+    await update.message.reply_text(
+        f"Added to MEMORY.md:\n`{text}`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
+async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /persona command — reload memory cache from disk."""
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, user_id):
+        return
+
+    if not context.args or context.args[0].lower() != "reload":
+        await update.message.reply_text(
+            "**Persona Commands:**\n"
+            "`/persona reload` — Refresh MEMORY, SOUL, USER from disk",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    async with _disk_lock:
+        await memory_cache.reload()
+
+    await update.message.reply_text(
+        "✅ Memory cache reloaded from disk.\n"
+        "MEMORY.md, SOUL.md, and USER.md are now up to date.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+
 async def cmd_agent_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /N commands where N is an agent number."""
     user_id = update.effective_user.id
@@ -471,7 +645,7 @@ async def cmd_agent_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
     
-    await process_task(update, message, agent_id=agent_id)
+    await process_task(update, context, message, agent_id=agent_id)
 
 
 # Task type commands
@@ -494,7 +668,7 @@ async def cmd_task_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
     
-    await process_task(update, content, task_type=command)
+    await process_task(update, context, content, task_type=command)
 
 
 # ============================================================================
@@ -522,6 +696,7 @@ async def check_authorization(update: Update, user_id: int) -> bool:
 
 async def process_task(
     update: Update, 
+    context: ContextTypes.DEFAULT_TYPE,
     text: str, 
     task_type: Optional[str] = None,
     agent_id: Optional[int] = None
@@ -557,19 +732,9 @@ async def process_task(
         await update.message.reply_text(f"Error: {e}")
         return
     
-    # Show typing indicator
-    await update.message.chat.send_action(ChatAction.TYPING)
-    
-    # Send processing message with agent info
-    agent_label = f"Agent {agent_id}" if agent_id > 1 else "Agent 1"
-    new_label = " (new)" if is_new else ""
-    
-    processing_msg = await update.message.reply_text(
-        f"[{agent_label}{new_label}] Processing...\n"
-        f"Task: `{task_type or 'general'}`",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
+    # Start continuous typing indicator
+    typing_task = asyncio.create_task(_keep_typing(update.message.chat, context.bot))
+
     try:
         # Execute task with agent's directory (each agent has separate conversation)
         result = await task_queue.submit_task(
@@ -580,30 +745,35 @@ async def process_task(
             is_new_session=is_new,
             chat_id=update.effective_chat.id  # Pass chat_id for reminder scheduling
         )
-        
+
+        # Stop typing indicator
+        typing_task.cancel()
+
         # Update agent usage
         agent_manager.touch_agent(user_id, agent_id)
-        
-        # Format and send result
-        response = result.to_telegram_message()
-        
-        # Add agent label to response
-        response = f"**[{agent_label}]**\n{response}"
-        
-        # Delete processing message and send result
+
+        # Format and send result with agent_id in footer
+        response = result.to_telegram_message(agent_id=agent_id)
+
+        # Sanitize markdown for Telegram compatibility
+        sanitized = sanitize_markdown_for_telegram(response)
+
         try:
-            await processing_msg.delete()
-        except Exception:
-            pass
-        
-        await update.message.reply_text(
-            response,
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
+            await update.message.reply_text(
+                sanitized,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except BadRequest as e:
+            logger.warning(f"Markdown parse failed ({e}); retrying with plain text.")
+            # Fallback: strip all markdown and send plain text
+            plain_text = strip_all_markdown(response)
+            await update.message.reply_text(plain_text)
+
     except Exception as e:
+        # Stop typing indicator
+        typing_task.cancel()
         logger.error(f"Task processing error: {e}")
-        await processing_msg.edit_text(
+        await update.message.reply_text(
             f"Error processing task: {str(e)[:200]}"
         )
 
@@ -622,16 +792,72 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     if agent_id is not None:
         # Route to specific agent
-        await process_task(update, message, agent_id=agent_id)
+        await process_task(update, context, message, agent_id=agent_id)
     else:
         # Default agent (1)
-        await process_task(update, text)
+        await process_task(update, context, text)
+
+
+async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle incoming photo messages."""
+    user_id = update.effective_user.id
+
+    if not await check_authorization(update, user_id):
+        return
+
+    # Show typing indicator
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    # Get the highest resolution photo
+    photo = update.message.photo[-1]
+
+    # Get caption if provided
+    caption = update.message.caption or "What's in this image?"
+
+    analyzing_msg = await update.message.reply_text("📸 Analyzing image...")
+
+    try:
+        # Download the photo
+        file = await context.bot.get_file(photo.file_id)
+
+        # Create temp directory for images
+        temp_dir = Path(settings.working_directory) / "data" / "temp_images"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save image with unique name
+        image_path = temp_dir / f"{user_id}_{photo.file_id}.jpg"
+        await file.download_to_drive(str(image_path))
+
+        # Create prompt with image reference
+        prompt = f"Analyze this image: {image_path}\n\nUser question: {caption}"
+
+        # Update message
+        await analyzing_msg.edit_text("🔍 Processing with AI...")
+
+        # Process with AI (will read the image)
+        await process_task(update, context, prompt)
+
+        # Delete analyzing message
+        try:
+            await analyzing_msg.delete()
+        except Exception:
+            pass
+
+        # Clean up image file
+        try:
+            image_path.unlink()
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"Photo handling error: {e}")
+        await analyzing_msg.edit_text(f"Error: {str(e)[:200]}")
 
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming voice messages."""
     user_id = update.effective_user.id
-    
+
     if not await check_authorization(update, user_id):
         return
     
@@ -669,9 +895,9 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         agent_id, message = parse_agent_command(result.text)
         
         if agent_id is not None:
-            await process_task(update, message, agent_id=agent_id)
+            await process_task(update, context, message, agent_id=agent_id)
         else:
-            await process_task(update, result.text)
+            await process_task(update, context, result.text)
         
         # Delete transcription message
         try:
@@ -706,6 +932,10 @@ def setup_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("wipe", cmd_wipe))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("reminders", cmd_reminders))
+    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("session", cmd_session))
+    app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("persona", cmd_persona))
     
     # Task type commands
     for task_type in ALLOWED_TASK_TYPES:
@@ -723,6 +953,10 @@ def setup_handlers(app: Application) -> None:
         handle_text_message
     ))
     app.add_handler(MessageHandler(
+        filters.PHOTO,
+        handle_photo_message
+    ))
+    app.add_handler(MessageHandler(
         filters.VOICE,
         handle_voice_message
     ))
@@ -733,6 +967,7 @@ async def set_bot_commands(app: Application) -> None:
     commands = [
         BotCommand("start", "Start the bot"),
         BotCommand("help", "Show help"),
+        BotCommand("search", "Search the web"),
         BotCommand("agents", "List active agents"),
         BotCommand("new", "Create new agent"),
         BotCommand("model", "View/change LLM model"),
@@ -741,6 +976,9 @@ async def set_bot_commands(app: Application) -> None:
         BotCommand("wipe", "Clear all agents & chat"),
         BotCommand("status", "Check session status"),
         BotCommand("cancel", "Cancel running task"),
+        BotCommand("session", "Manage session data"),
+        BotCommand("memory", "Promote a note to MEMORY.md"),
+        BotCommand("persona", "Reload memory cache"),
     ]
     await app.bot.set_my_commands(commands)
 
@@ -748,18 +986,43 @@ async def set_bot_commands(app: Application) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """FastAPI lifespan handler for startup/shutdown."""
-    global settings, security_manager, voice_handler, task_queue, agent_manager, telegram_app, reminder_scheduler
-    
+    global settings, security_manager, voice_handler, task_queue, agent_manager, telegram_app, reminder_scheduler, brave_search, memory_cache, session_cache, daily_scratchpad
+
     logger.info("Starting up...")
-    
+
     # Load configuration
     settings = load_settings()
-    
+
+    # Initialize caching system (PERSONA_CACHE pattern)
+    memory_dir = settings.working_directory / "memory"
+    data_dir = settings.working_directory / "data"
+
+    memory_cache = MemoryCache(memory_dir)
+    await memory_cache.load()
+    logger.info("Memory cache loaded")
+
+    session_cache = SessionCache(data_dir, flush_interval=5.0)
+    session_cache.start()
+    logger.info("Session cache started")
+
+    daily_scratchpad = DailyScratchpad(memory_dir)
+    logger.info("Daily scratchpad initialized")
+
     # Initialize components
     security_manager = create_security_manager(settings)
     voice_handler = create_voice_handler(settings)
-    task_queue = create_task_queue(settings)
     agent_manager = AgentManager()
+
+    # Initialize Brave Search if API key is provided
+    if settings.brave_search_api_key:
+        brave_search = create_brave_search_client(settings.brave_search_api_key)
+        logger.info("Brave Search initialized")
+    else:
+        brave_search = None
+        logger.warning("Brave Search API key not configured")
+
+    # Create task queue with Brave Search integration
+    task_queue = create_task_queue(settings, brave_search_client=brave_search)
     
     # Create Telegram application
     telegram_app = (
@@ -815,8 +1078,13 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down...")
-    
-    # Stop scheduler first
+
+    # Stop session cache (flushes dirty sessions)
+    if session_cache:
+        session_cache.stop()
+        logger.info("Session cache stopped and flushed")
+
+    # Stop scheduler
     if reminder_scheduler:
         reminder_scheduler.shutdown()
         logger.info("Reminder scheduler stopped")

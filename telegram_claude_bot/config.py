@@ -35,11 +35,14 @@ class Settings(BaseSettings):
     claude_code_path: Optional[str] = None
     claude_working_dir: Optional[str] = None
     task_timeout: int = 300
-    claude_model: str = "claude-sonnet-4-20250514"  # Default model
+    claude_model: str = "claude-sonnet-4-5"  # Default model
     
     # Whisper
     whisper_model: str = "base"
     whisper_device: str = "cpu"
+
+    # Brave Search
+    brave_search_api_key: Optional[str] = None
     
     @property
     def allowed_user_ids_list(self) -> List[int]:
@@ -99,7 +102,8 @@ ALLOWED_SHELL_COMMANDS = {
 FORBIDDEN_PATTERNS = [
     "rm -rf",
     "del /f /s /q",
-    "format",
+    "format c:",
+    "format /dev/",
     "mkfs",
     ":(){:|:&};:",  # Fork bomb
     "dd if=",
